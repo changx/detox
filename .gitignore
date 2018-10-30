@@ -1,0 +1,7 @@
+.idea
+test
+server
+detox
+cache.json
+docker-compose.yaml
+Makefile
