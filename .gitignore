@@ -5,3 +5,5 @@ detox
 cache.json
 docker-compose.yaml
 Makefile
+go.mod
+go.sum

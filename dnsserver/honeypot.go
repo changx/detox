@@ -1,187 +1,198 @@
 package dnsserver
 
 import (
-	"encoding/json"
-	"github.com/labstack/gommon/log"
+	"container/list"
+	"crypto/tls"
 	"github.com/miekg/dns"
+	"log"
 	"os"
 	"sync"
 	"time"
 )
 
-var honeypotOnce = sync.Once{}
-var honeypotResolver *dns.Client
-var honeypotDNS string
-
-var cacheOnce = sync.Once{}
-var nameCache = sync.Map{}
-var defaultCacheTTL = 300 * time.Second
-
-type hostnameCacheItem struct {
-	State  int   `json:"state"`
-	Expiry int64 `json:"expiry"`
+type Detective struct {
+	safeDNS        string
+	localDNS       string
+	honeypotDNS    string
+	cache          *DetectCache
+	unsafeResolver *dns.Client
+	safeResolver   *dns.Client
 }
 
-const (
-	kHostNameClean    = 1
-	kHostNamePolluted = 2
-)
-
-func addNameToCache(name string, state int) {
-	now := time.Now().Add(time.Hour).Unix()
-	nameCache.Store(name, hostnameCacheItem{
-		State: state,
-		Expiry: now,
-	})
+/*
+	lru cache for pollution result, copy from tls pkg :P
+ */
+type DetectCache struct {
+	sync.Mutex
+	m        map[string]*list.Element
+	q        *list.List
+	capacity int
 }
 
-func initHoneyPotResolver() {
-	cacheOnce.Do(func() {
-		honeypotDNS = os.Getenv("HONEYPOT_DNS")
-		if honeypotDNS == "" {
-			honeypotDNS = "198.11.138.248:53"
-		}
-		localDNS = os.Getenv("LOCAL_DNS")
-		if localDNS == "" {
-			localDNS = "119.29.29.29:53"
-		}
-		honeypotResolver = new(dns.Client)
-
-		log.Printf("HONEYPOT_DNS %s as GFW DNS honey pot", honeypotDNS)
-		log.Printf("LOCAL_DNS %s as local resolver", localDNS)
-
-		cacheFile, _ := os.Open("/detox/cache.json")
-		if cacheFile != nil {
-			defer cacheFile.Close()
-			cacheMap := make(map[string]hostnameCacheItem)
-			json.NewDecoder(cacheFile).Decode(&cacheMap)
-
-			if len(cacheMap) > 0 {
-				for key, val := range cacheMap {
-					nameCache.Store(key, val)
-				}
-			}
-		}
-	})
+type pollutionCacheEntry struct {
+	hostname string
+	state    int
 }
 
-func cacheSupervisor() {
-	expiredNames := make([]string, 0)
-	for {
-		log.Print("clearning expired cache")
+const HostnamePolluted = 1
+const HostnameClean = 2
 
-		cacheMap := make(map[string]interface{})
-		now := time.Now().Unix()
-		expiredNames = expiredNames[:0]
-		nameCache.Range(func(key, value interface{}) bool {
-			cacheItem := value.(hostnameCacheItem)
-			if cacheItem.Expiry >= now {
-				cacheMap[key.(string)] = cacheItem
-			} else {
-				expiredNames = append(expiredNames, key.(string))
-			}
-			return true
-		})
+func (pc *DetectCache) Get(hostname string) (int, bool) {
+	pc.Lock()
+	defer pc.Unlock()
 
-		for _, name := range expiredNames {
-			nameCache.Delete(name)
-		}
-
-		// serialize to cache file
-		if cacheMap != nil {
-			if cacheFile, err := os.Create("/detox/cache.json"); err == nil {
-				if cache, err := json.Marshal(cacheMap); cache != nil {
-					cacheFile.Write(cache)
-				} else {
-					log.Printf("cache serialization failed", err.Error())
-				}
-				cacheFile.Close()
-			} else {
-				log.Print("unable create cache file")
-			}
-		}
-		log.Print("validation done")
-		time.Sleep(defaultCacheTTL)
+	if el, ok := pc.m[hostname]; ok {
+		pc.q.MoveToFront(el)
+		return el.Value.(*pollutionCacheEntry).state, true
 	}
+	return 0, false
 }
 
-func IsHostnamePolluted(hostname string) bool {
+func (pc *DetectCache) Put(hostname string, state int) {
+	pc.Lock()
+	defer pc.Unlock()
 
-	if isCachedHostname(hostname) {
-		return cachedResult(hostname)
+	if r, ok := pc.m[hostname]; ok {
+		pc.q.MoveToFront(r)
+		return
 	}
 
-	return validateHostname(hostname, 0)
+	if pc.q.Len() < pc.capacity {
+		entry := &pollutionCacheEntry{
+			hostname: hostname,
+			state:    state,
+		}
+		pc.m[hostname] = pc.q.PushFront(entry)
+		return
+	}
+
+	el := pc.q.Back()
+	entry := el.Value.(*pollutionCacheEntry)
+	delete(pc.m, entry.hostname)
+	entry.hostname = hostname
+	entry.state = state
+	pc.q.MoveToFront(el)
+	pc.m[hostname] = el
 }
 
-func validateHostname(hostname string, try int) bool {
-
-	if try > 5 {
-		addNameToCache(hostname, kHostNamePolluted)
-		return cachedResult(hostname)
+func (pr *Detective) IsPolluted(hostname string, retry int) bool {
+	if retry > 3 {
+		// too many tries, force proxy
+		return true
 	}
 
-	if try > 0 {
-		log.Printf("retrying %s, %d times", hostname, try)
-	}
-
-	targetHostname := hostname
-	//if hostname == "google.com" {
-	//	targetHostname = "www.google.com"
-	//}
-
-	q := new(dns.Msg)
-	q.SetQuestion(dns.Fqdn(targetHostname), dns.TypeA)
-	answer, _, err := honeypotResolver.Exchange(q, honeypotDNS)
-	if err != nil {
-		log.Printf("err: %s", err.Error())
-		return validateHostname(hostname, try+1)
-	}
-
-	if answer.Answer != nil {
-		addNameToCache(hostname, kHostNamePolluted)
+	if state, ok := pr.cache.Get(hostname); ok {
+		return state == HostnamePolluted
 	} else {
-		answer, _, err = honeypotResolver.Exchange(q, localDNS)
-		if answer == nil || err != nil {
-			return validateHostname(hostname, try+1)
-		}
+		q := new(dns.Msg)
+		fqdn := dns.Fqdn(hostname)
 
-		for _, rr := range answer.Answer {
-			if rr.Header().Rrtype == dns.TypeCNAME {
-				cname := rr.(*dns.CNAME)
-				log.Debugf("[[[[cname]]]]: %+v\n", cname)
-				if IsHostnamePolluted(cname.Target) {
-					log.Debugf("cname %s polluted", cname.Target)
-					addNameToCache(cname.Target, kHostNamePolluted)
-					addNameToCache(hostname, kHostNamePolluted)
-					return cachedResult(hostname)
-				} else {
-					addNameToCache(cname.Target, kHostNameClean)
-					// cname target is clean, continue next target
-				}
-			}
-		}
+		q.SetQuestion(fqdn, dns.TypeA)
 
-		addNameToCache(hostname, kHostNameClean)
-	}
-	return cachedResult(hostname)
-}
-
-func cachedResult(hostname string) bool {
-	if result, ok := nameCache.Load(hostname); ok {
-		cacheItem := result.(hostnameCacheItem)
-		switch cacheItem.State {
-		case kHostNameClean:
-			return false
-		default:
+		if answer, _, err := pr.unsafeResolver.Exchange(q, pr.honeypotDNS); err != nil {
+			return pr.IsPolluted(hostname, retry+1)
+		} else if answer.Answer != nil {
+			// GFW 如果抢答，判定为污染
+			pr.cache.Put(hostname, HostnamePolluted)
 			return true
+		} else {
+			// GFW 未抢答
+			// 用本地 DNS 检查 hostname 解析结果中的 CNAME 记录, 需要递归判定是否 CNAME 被污染
+			// 如果结果中的 CNAME 记录被污染，返回的结果仍然是不可用的
+			if answer, _, err := pr.unsafeResolver.Exchange(q, pr.localDNS); err != nil {
+				return pr.IsPolluted(hostname, retry+1)
+			} else if answer != nil {
+				for _, rr := range answer.Answer {
+					if rr.Header().Rrtype == dns.TypeCNAME {
+						cname := rr.(*dns.CNAME)
+						if pr.IsPolluted(cname.Target, 0) {
+							pr.cache.Put(hostname, HostnamePolluted)
+							return true
+						} else {
+							pr.cache.Put(cname.Target, HostnameClean)
+						}
+					}
+				}
+			} else {
+				// no error, no answer ，拒绝解析也是 GFW 一种污染手段，也有可能是偶然的网络错误，强制走代理
+				pr.cache.Put(hostname, HostnamePolluted)
+				return true
+			}
+
+			// 不是 CNAME，或者 CNAME 检查通过
+			pr.cache.Put(hostname, HostnameClean)
 		}
 	}
-	// ya, force result as polluted
-	return true
+	return false
 }
 
-func isCachedHostname(hostname string) bool {
-	_, ok := nameCache.Load(hostname)
-	return ok
+func (pr *Detective) Resolve(oq *dns.Msg) *dns.Msg {
+	q := new(dns.Msg)
+	q.SetQuestion(oq.Question[0].Name, oq.Question[0].Qtype)
+
+	var answer *dns.Msg
+
+	if state, ok := pr.cache.Get(q.Question[0].Name); ok {
+		log.Printf("cached detect result: %s = %d", oq.Question[0].Name, state)
+		if state == HostnamePolluted {
+			answer, _, _ = pr.safeResolver.Exchange(q, pr.safeDNS)
+		} else {
+			answer, _, _ = pr.unsafeResolver.Exchange(q, pr.localDNS)
+		}
+	} else {
+		log.Printf("checking %s", q.Question[0].Name)
+		pollutionDetect := pr.IsPolluted(q.Question[0].Name, 0)
+		if pollutionDetect {
+			answer, _, _ = pr.safeResolver.Exchange(q, pr.safeDNS)
+		} else {
+			answer, _, _ = pr.unsafeResolver.Exchange(q, pr.localDNS)
+		}
+	}
+
+	return answer
+}
+
+func initDetective() *Detective {
+	tlsResolver := new(dns.Client)
+	tlsResolver.Net = "tcp4-tls"
+	tlsResolver.TLSConfig = &tls.Config{
+		InsecureSkipVerify: true,
+		ClientSessionCache: tls.NewLRUClientSessionCache(64),
+		MinVersion:         tls.VersionTLS11,
+		MaxVersion:         tls.VersionTLS12,
+	}
+
+	tlsResolver.DialTimeout = 5 * time.Second
+
+	detective := Detective{
+		unsafeResolver: new(dns.Client),
+		safeResolver:   tlsResolver,
+		cache: &DetectCache{
+			m:        make(map[string]*list.Element),
+			q:        list.New(),
+			capacity: 1024,
+		},
+	}
+
+	if dns := os.Getenv("TLS_DNS"); dns == "" {
+		tlsResolver.TLSConfig.ServerName = "9.9.9.9:853"
+		detective.safeDNS = "9.9.9.9:853"
+	} else {
+		tlsResolver.TLSConfig.ServerName = dns
+		detective.safeDNS = dns
+	}
+
+	if dns := os.Getenv("LOCAL_DNS"); dns == "" {
+		detective.localDNS = "119.29.29.29:53"
+	} else {
+		detective.localDNS = dns
+	}
+
+	if dns := os.Getenv("HONEYPOT_DNS"); dns == "" {
+		detective.honeypotDNS = "198.11.138.248:53"
+	} else {
+		detective.honeypotDNS = dns
+	}
+
+	return &detective
 }
