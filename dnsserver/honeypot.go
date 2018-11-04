@@ -149,6 +149,10 @@ func (pr *Detective) Resolve(oq *dns.Msg) *dns.Msg {
 		}
 	}
 
+	if answer == nil || answer.Answer == nil {
+		answer, _, _ = pr.safeResolver.Exchange(q, pr.safeDNS)
+	}
+
 	return answer
 }
 
